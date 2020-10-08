@@ -26,8 +26,13 @@ from pymavlink import mavutil
 from mavros import mavlink
 from mavros_msgs.msg import Mavlink
 
-# Define which method we will use: object tracking or features
-tracking_method = 'features'
+# Default method
+tracking_method = 'tracker'
+# ROS param defines which method we will use: object tracking or features
+if rospy.has_param('/presizion_takeoff_method'):
+    tracking_method = rospy.get_param('/presizion_takeoff_method')
+    if tracking_method not in ['tracker', 'features']:
+        tracking_method = 'tracker'
 
 # Pipeline to send video frames to QGC
 stream = cv2.VideoWriter(
@@ -37,7 +42,6 @@ if not stream.isOpened():
 
 # initialize OpenCV's CSRT tracker
 tracker = cv2.TrackerCSRT_create()
-
 
 rospy.init_node('presizion_takeoff')
 navigate = rospy.ServiceProxy('navigate', srv.Navigate)
@@ -64,35 +68,56 @@ previous_descriptors = None
 previous_keypoints = None
 summary_keypoint_offset_x = 0
 summary_keypoint_offset_y = 0
+summary_keypoint_offset_meters_x = 0
+summary_keypoint_offset_meters_y = 0
+previous_rangefinder = 0
 
 # Running object tracker
+
+
 def run_tracker(x, y):
     global tracker_initialized, cv_image, tracker
     r = 15
     tracker_bbox = (x - r, y - r, r * 2, r * 2)
 
     if tracker_initialized:
-		del tracker
-		tracker = cv2.TrackerCSRT_create()
+        del tracker
+        tracker = cv2.TrackerCSRT_create()
 
-	# Initialize tracker with first frame and bounding box
+        # Initialize tracker with first frame and bounding box
     ok = tracker.init(cv_image, tracker_bbox)
     tracker_initialized = True
 
+# Translate pixel coordinates into real using rangefinder data and similar triangles
+
+
+def calculate_real_coordinates(px_x, px_y, rangefinder_z):
+    global central_point_x, central_point_y, focal_length
+    real_x = ((float(px_x) - central_point_x) /
+              focal_length) * rangefinder_z
+    real_y = ((float(px_y) - central_point_y) /
+              focal_length) * rangefinder_z
+    return (real_x, real_y)
 
 # Calculation of start point coordinates (tracker method)
+
+
 def calculate_start_point(tracking_point_x, tracking_point_y, rangefinder_data):
-    real_x = ((float(tracking_point_x) - central_point_x) / \
-              focal_length) * rangefinder_data.range
-    real_y = ((float(tracking_point_y) - central_point_y) / \
-              focal_length) * rangefinder_data.range
+    real_x, real_y = calculate_real_coordinates(
+        tracking_point_x, tracking_point_y, rangefinder_data.range)
 
     dst_to_start_point = math.hypot(abs(real_x), abs(real_y))
 
     # Drawing line with distance in meters from current image center to start point
-    cv2.arrowedLine(cv_image, (camera_info.width / 2, camera_info.height / 2), (tracking_point_x, tracking_point_y), (255, 0, 0), 2)
-    cv2.putText(cv_image, str(dst_to_start_point), (camera_info.width / 2, camera_info.height / 2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1)
+    cv2.arrowedLine(cv_image, (camera_info.width / 2, camera_info.height / 2),
+                    (tracking_point_x, tracking_point_y), (255, 0, 0), 2)
+    cv2.putText(cv_image, str(dst_to_start_point), (camera_info.width / 2,
+                                                    camera_info.height / 2), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 1)
 
+    publish_start_point(real_x, real_y, rangefinder_data.range)
+
+
+def publish_start_point(real_x, real_y, rangefinder_z):
     # Publishing topic to draw start point in rviz
     msg = geometry_msgs.msg.PointStamped()
     msg.header.stamp = rospy.Time.now()
@@ -100,14 +125,16 @@ def calculate_start_point(tracking_point_x, tracking_point_y, rangefinder_data):
 
     msg.point.x = -real_y
     msg.point.y = -real_x
-    msg.point.z = -rangefinder_data.range
+    msg.point.z = -rangefinder_z
 
     # print("Start point coordinates - x: ", real_x, " y: ", real_y,
     #       " z: ", rangefinder_data.range)
     start_point_pub.publish(msg)
 
+
 # It is for simple timer functionality
 last_time = rospy.get_time()
+
 
 def image_callback(frame):
 
@@ -121,10 +148,9 @@ def image_callback(frame):
     if tracking_method == 'tracker' and tracker_initialized:
         (ok, bbox) = tracker.update(cv_image)
 
-        # HOLD mode when lost target
+        # When lost target
         if not ok:
             print("Tracker reported failure")
-            set_mode(custom_mode='HOLD')
             del tracker
             tracker = cv2.TrackerCSRT_create()
             tracker_initialized = False
@@ -142,12 +168,13 @@ def image_callback(frame):
         rangefinder_data = rospy.wait_for_message(
             'rangefinder/range', Range)
 
-        calculate_start_point(landing_point_x, landing_point_y, rangefinder_data)
-            # last_time = rospy.get_time()
+        calculate_start_point(
+            landing_point_x, landing_point_y, rangefinder_data)
+        # last_time = rospy.get_time()
 
     elif tracking_method == 'features':
-        global previous_descriptors, summary_keypoint_offset_x, summary_keypoint_offset_y, previous_keypoints
-        
+        global previous_descriptors, summary_keypoint_offset_x, summary_keypoint_offset_y, previous_keypoints, previous_rangefinder, summary_keypoint_offset_meters_x, summary_keypoint_offset_meters_y
+
         # Initiate ORB detector
         orb = cv2.ORB_create()
 
@@ -157,6 +184,9 @@ def image_callback(frame):
         # compute the descriptors with ORB
         kp, current_descriptors = orb.compute(cv_image, kp)
 
+        current_rangefinder = rospy.wait_for_message(
+            'rangefinder/range', Range)
+
         if previous_descriptors is not None:
             # create BFMatcher object
             bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
@@ -165,9 +195,10 @@ def image_callback(frame):
             matches = bf.match(current_descriptors, previous_descriptors)
 
             # Sort them in the order of their distance.
-            matches = sorted(matches, key = lambda x:x.distance)
+            matches = sorted(matches, key=lambda x: x.distance)
 
-            cv_image = cv2.drawKeypoints(cv_image, kp, None, color=(0,255,0), flags=cv2.DRAW_MATCHES_FLAGS_DEFAULT)
+            cv_image = cv2.drawKeypoints(cv_image, kp, None, color=(
+                0, 255, 0), flags=cv2.DRAW_MATCHES_FLAGS_DEFAULT)
 
             if len(matches) > 0:
                 matched_kp = []
@@ -176,29 +207,52 @@ def image_callback(frame):
                 avg_offset_px_x = 0
                 avg_offset_px_y = 0
 
+                # Average offset of currently matched keypoints in meters
+                avg_offset_meters_x = 0
+                avg_offset_meters_y = 0
+
                 best_matches_num = 10
 
                 for m in matches[:best_matches_num]:
                     matched_kp.append(kp[m.queryIdx])
-                    avg_offset_px_x += kp[m.queryIdx].pt[0] - previous_keypoints[m.trainIdx].pt[0]
-                    avg_offset_px_y += kp[m.queryIdx].pt[1] - previous_keypoints[m.trainIdx].pt[1]
+                    avg_offset_px_x += kp[m.queryIdx].pt[0] - \
+                        previous_keypoints[m.trainIdx].pt[0]
+                    avg_offset_px_y += kp[m.queryIdx].pt[1] - \
+                        previous_keypoints[m.trainIdx].pt[1]
+
+                    real_cur_kp_x, real_cur_kp_y = calculate_real_coordinates(
+                        kp[m.queryIdx].pt[0], kp[m.queryIdx].pt[1], current_rangefinder.range)
+                    real_prev_kp_x, real_prev_kp_y = calculate_real_coordinates(
+                        previous_keypoints[m.trainIdx].pt[0], previous_keypoints[m.trainIdx].pt[1], previous_rangefinder.range)
+
+                    avg_offset_meters_x += real_cur_kp_x - real_prev_kp_x
+                    avg_offset_meters_y += real_cur_kp_y - real_prev_kp_y
 
                 avg_offset_px_x = avg_offset_px_x / best_matches_num
                 avg_offset_px_y = avg_offset_px_y / best_matches_num
-
                 summary_keypoint_offset_x += avg_offset_px_x
                 summary_keypoint_offset_y += avg_offset_px_y
 
+                avg_offset_meters_x = avg_offset_meters_x / best_matches_num
+                avg_offset_meters_y = avg_offset_meters_y / best_matches_num
+                summary_keypoint_offset_meters_x += avg_offset_meters_x
+                summary_keypoint_offset_meters_y += avg_offset_meters_y
+                publish_start_point(0 + summary_keypoint_offset_meters_x, 0 +
+                                    summary_keypoint_offset_meters_y, current_rangefinder.range)
+
                 # print(summary_keypoint_offset_x, summary_keypoint_offset_y)
 
-                cv_image = cv2.drawKeypoints(cv_image, matched_kp, None, color=(0,0,255), flags=cv2.DRAW_MATCHES_FLAGS_DEFAULT)
+                cv_image = cv2.drawKeypoints(cv_image, matched_kp, None, color=(
+                    0, 0, 255), flags=cv2.DRAW_MATCHES_FLAGS_DEFAULT)
 
-                cv2.arrowedLine(cv_image, (camera_info.width / 2, camera_info.height / 2), (int(camera_info.width / 2 + summary_keypoint_offset_x), int(camera_info.height / 2 + summary_keypoint_offset_y)), (255, 0, 0), 2)
+                cv2.arrowedLine(cv_image, (camera_info.width / 2, camera_info.height / 2), (int(camera_info.width / 2 +
+                                                                                                summary_keypoint_offset_meters_x*100), int(camera_info.height / 2 + summary_keypoint_offset_meters_y*100)), (0, 0, 255), 2)
+                cv2.arrowedLine(cv_image, (camera_info.width / 2, camera_info.height / 2), (int(camera_info.width / 2 +
+                                                                                                summary_keypoint_offset_x), int(camera_info.height / 2 + summary_keypoint_offset_y)), (255, 0, 0), 2)
 
-                
         previous_keypoints = kp
         previous_descriptors = current_descriptors
-                
+        previous_rangefinder = current_rangefinder
 
     # show the output frame
     cv2.imshow("Frame", cv_image)
@@ -210,7 +264,8 @@ def image_callback(frame):
 
 
 image_sub = rospy.Subscriber('main_camera/image_raw', Image, image_callback)
-start_point_pub = rospy.Publisher('start_point_position', geometry_msgs.msg.PointStamped, queue_size=1)
+start_point_pub = rospy.Publisher(
+    'start_point_position', geometry_msgs.msg.PointStamped, queue_size=1)
 
 z = 0
 z_direction = 1
@@ -219,7 +274,7 @@ y_direction = 1
 
 # Startup initialization
 navigate(x=0, y=0, z=0.5,
-             yaw=float('nan'), speed=1, frame_id='map', auto_arm=True)
+         yaw=float('nan'), speed=1, frame_id='map', auto_arm=True)
 rospy.sleep(10)
 
 run_tracker(camera_info.width / 2, camera_info.height / 2)
@@ -246,7 +301,7 @@ while not rospy.is_shutdown():
     print("Navigate to x: ", x, " y: ", y,
           " z: ", z, "speed: ", speed)
 
-    # Moving continuously up and down with random horizontal offset 
+    # Moving continuously up and down with random horizontal offset
     navigate(x=x, y=y, z=z,
              yaw=float('nan'), speed=speed, frame_id='map', auto_arm=True)
 

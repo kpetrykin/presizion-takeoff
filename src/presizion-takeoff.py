@@ -72,9 +72,9 @@ summary_keypoint_offset_meters_x = 0
 summary_keypoint_offset_meters_y = 0
 previous_rangefinder = 0
 
+previous_tracker_landing_point = (0, 0)
+
 # Running object tracker
-
-
 def run_tracker(x, y):
     global tracker_initialized, cv_image, tracker
     r = 15
@@ -160,20 +160,15 @@ def image_callback(frame):
         landing_point_x = x + w/2
         landing_point_y = y + h/2
 
-        cv2.circle(cv_image, (landing_point_x, landing_point_y),
-                   1, (0, 0, 255), 1)
-        cv2.rectangle(cv_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
         # if rospy.get_time() - last_time > 1: # and telemetry.armed:
         rangefinder_data = rospy.wait_for_message(
             'rangefinder/range', Range)
 
-        calculate_start_point(
-            landing_point_x, landing_point_y, rangefinder_data)
+        
         # last_time = rospy.get_time()
 
-    elif tracking_method == 'features':
-        global previous_descriptors, summary_keypoint_offset_x, summary_keypoint_offset_y, previous_keypoints, previous_rangefinder, summary_keypoint_offset_meters_x, summary_keypoint_offset_meters_y
+        global previous_descriptors, summary_keypoint_offset_x, summary_keypoint_offset_y, previous_keypoints, \
+                previous_rangefinder, summary_keypoint_offset_meters_x, summary_keypoint_offset_meters_y, previous_tracker_landing_point
 
         # Initiate ORB detector
         orb = cv2.ORB_create()
@@ -184,8 +179,14 @@ def image_callback(frame):
         # compute the descriptors with ORB
         kp, current_descriptors = orb.compute(cv_image, kp)
 
-        current_rangefinder = rospy.wait_for_message(
-            'rangefinder/range', Range)
+        # current_rangefinder = rospy.wait_for_message(
+        #     'rangefinder/range', Range)
+
+        current_rangefinder = rangefinder_data
+
+        tracker_rect_color = (0, 255, 0)
+
+        drift_detected = False
 
         if previous_descriptors is not None:
             # create BFMatcher object
@@ -213,46 +214,69 @@ def image_callback(frame):
 
                 best_matches_num = 10
 
+                # How many keypoints detected tracker's drift
+                drift_detection_counter = 0
+                drift_distance_threshold = 0.1
+
                 for m in matches[:best_matches_num]:
                     matched_kp.append(kp[m.queryIdx])
-                    avg_offset_px_x += kp[m.queryIdx].pt[0] - \
-                        previous_keypoints[m.trainIdx].pt[0]
-                    avg_offset_px_y += kp[m.queryIdx].pt[1] - \
-                        previous_keypoints[m.trainIdx].pt[1]
 
-                    real_cur_kp_x, real_cur_kp_y = calculate_real_coordinates(
-                        kp[m.queryIdx].pt[0], kp[m.queryIdx].pt[1], current_rangefinder.range)
-                    real_prev_kp_x, real_prev_kp_y = calculate_real_coordinates(
-                        previous_keypoints[m.trainIdx].pt[0], previous_keypoints[m.trainIdx].pt[1], previous_rangefinder.range)
+                    cur_kp_dst_to_landing_point =  math.hypot(kp[m.queryIdx].pt[0] - landing_point_x, kp[m.queryIdx].pt[1] - landing_point_y)
+                    prev_kp_dst_to_landing_point = math.hypot(previous_keypoints[m.trainIdx].pt[0] - previous_tracker_landing_point[0], previous_keypoints[m.trainIdx].pt[1] - previous_tracker_landing_point[1])
 
-                    avg_offset_meters_x += real_cur_kp_x - real_prev_kp_x
-                    avg_offset_meters_y += real_cur_kp_y - real_prev_kp_y
+                    if abs(cur_kp_dst_to_landing_point - prev_kp_dst_to_landing_point) / prev_kp_dst_to_landing_point > drift_distance_threshold:
+                        drift_detection_counter += 1
 
-                avg_offset_px_x = avg_offset_px_x / best_matches_num
-                avg_offset_px_y = avg_offset_px_y / best_matches_num
-                summary_keypoint_offset_x += avg_offset_px_x
-                summary_keypoint_offset_y += avg_offset_px_y
+                if drift_detection_counter >= 5:
+                    print('Drift detected!')
+                    tracker_rect_color = (0, 0, 255)
 
-                avg_offset_meters_x = avg_offset_meters_x / best_matches_num
-                avg_offset_meters_y = avg_offset_meters_y / best_matches_num
-                summary_keypoint_offset_meters_x += avg_offset_meters_x
-                summary_keypoint_offset_meters_y += avg_offset_meters_y
-                publish_start_point(0 + summary_keypoint_offset_meters_x, 0 +
-                                    summary_keypoint_offset_meters_y, current_rangefinder.range)
+                    drift_detected = True
+
+                    centroid_x_sum = 0
+                    centroid_y_sum = 0
+
+                    m_cnt = 0
+
+                    # Calculating true tracker position based on previous frame keypoints
+                    for m in matches[:best_matches_num]:
+                        m_cnt += 1
+                        prev_x_to_lp_offset = previous_keypoints[m.trainIdx].pt[0] - previous_tracker_landing_point[0]
+                        cur_x_coordinate = kp[m.queryIdx].pt[0] - prev_x_to_lp_offset
+                        centroid_x_sum += cur_x_coordinate
+
+                        prev_y_to_lp_offset = previous_keypoints[m.trainIdx].pt[1] - previous_tracker_landing_point[1]
+                        cur_y_coordinate = kp[m.queryIdx].pt[1] - prev_y_to_lp_offset
+                        centroid_y_sum += cur_y_coordinate
+
+                    new_landing_point_x = int(centroid_x_sum / m_cnt)
+                    new_landing_point_y = int(centroid_y_sum / m_cnt)
+
+                    print("Restarting tracker at: ", new_landing_point_x, ", ", new_landing_point_y)
+
+                    # Run tracker at a detected point
+                    run_tracker(new_landing_point_x, new_landing_point_y)
+
 
                 # print(summary_keypoint_offset_x, summary_keypoint_offset_y)
 
                 cv_image = cv2.drawKeypoints(cv_image, matched_kp, None, color=(
                     0, 0, 255), flags=cv2.DRAW_MATCHES_FLAGS_DEFAULT)
 
-                cv2.arrowedLine(cv_image, (camera_info.width / 2, camera_info.height / 2), (int(camera_info.width / 2 +
-                                                                                                summary_keypoint_offset_meters_x*100), int(camera_info.height / 2 + summary_keypoint_offset_meters_y*100)), (0, 0, 255), 2)
-                cv2.arrowedLine(cv_image, (camera_info.width / 2, camera_info.height / 2), (int(camera_info.width / 2 +
-                                                                                                summary_keypoint_offset_x), int(camera_info.height / 2 + summary_keypoint_offset_y)), (255, 0, 0), 2)
+        if not drift_detected:
+            previous_keypoints = kp
+            previous_descriptors = current_descriptors
+            previous_rangefinder = current_rangefinder
+            previous_tracker_landing_point = (landing_point_x, landing_point_y)
+        else:
+            previous_descriptors = None
 
-        previous_keypoints = kp
-        previous_descriptors = current_descriptors
-        previous_rangefinder = current_rangefinder
+        cv2.circle(cv_image, (landing_point_x, landing_point_y),
+                   1, (0, 0, 255), 1)
+        cv2.rectangle(cv_image, (x, y), (x + w, y + h), tracker_rect_color, 2)
+
+        calculate_start_point(
+            landing_point_x, landing_point_y, rangefinder_data)
 
     # show the output frame
     cv2.imshow("Frame", cv_image)
@@ -294,7 +318,7 @@ while not rospy.is_shutdown():
     y_direction = y_direction * -1
     y = random.random() * y_direction
 
-    speed = random.random()
+    speed = 1 #random.random()
 
     z = z + 1 * z_direction
 
